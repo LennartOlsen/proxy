@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"log"
 	"io"
-	"sync"
 	"strconv"
 	"time"
 )
@@ -20,24 +19,19 @@ type Backend struct {
 
 var backendQueue chan *Backend
 
-//Map is a key value pair
-// it has strings for keys and int for values
-var requestBytes map[string]int64
-var requestLock sync.Mutex
-
 // init runs when the program starts
 // kinda like main, but this one can be in every module of a program
 // There can only be one main
 func init() {
-	requestBytes = make(map[string]int64)
 	backendQueue = make(chan *Backend, 10) 	//channel at a size of 10
 						//This is a buffered channel.
 						//This means that it can hold 10 Backends before it starts to block
 }
 
 func main() {
+	log.Println("Listening")
 	//listen for a connection on socket 8080 (always)
-	ln, err := net.Listen("tcp", ":8080");
+	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		log.Fatalf("Failed to listen: %s", err)
 	}
@@ -45,6 +39,7 @@ func main() {
 	for {
 		//accept all connections
 		if conn, err := ln.Accept(); err == nil {
+			log.Println("got connection")
 			//Mega concurrent
 			// Take this function call and go run it somewhere else
 			go handleConnection(conn)
@@ -66,6 +61,7 @@ func handleConnection(conn net.Conn){
 	// we can read requests as in a loop pr user :D
 	for{
 		req, err := http.ReadRequest(reader);
+		log.Println("Reading request");
 
 		// As we need to know when the user goes away (the connection closes)
 		// We need to return
@@ -79,42 +75,42 @@ func handleConnection(conn net.Conn){
 			return
 		}
 
-		// Connect to the backend webserver
-		// Consider resolving this somehow (map between port and service)
-		if be, err := net.Dial("tcp", "127.0.0.1:8081"); err == nil {
-			//reader for the connection to the webserver
-			beReader := bufio.NewReader(be)
-			// Forward the request to the server
-			if err := req.Write(be); err == nil {
-				//read the response from the backend
-				if resp, err := http.ReadResponse(beReader, req); err == nil {
 
-					bytes := updateStats(req, resp);
-					resp.Header.Set("X-Bytes", strconv.FormatInt(bytes, 10))
+		be, err := getBackend()
 
-					//send response to the client.
-					resp.Close = true
-					if err := resp.Write(conn); err == nil {
-						log.Printf("%s: %d", req.URL.Path, resp.StatusCode)
-						log.Printf("Content Length: %d", resp.ContentLength)
-					}
-				}
-			}
+		if err != nil {
+			return
 		}
+
+		// Forward the request to the "backend"
+		if err := req.Write(be.Writer); err == nil {
+			log.Println("Writing request");
+			be.Writer.Flush()
+
+			//read the response from the backend
+			resp, err := http.ReadResponse(be.Reader, req)
+			if err != nil {
+				log.Printf("Error on reading response %v", err)
+				return;
+			}
+
+			log.Println("reading response")
+
+			bytes := UpdateStats(req, resp);
+			resp.Header.Set("X-Bytes", strconv.FormatInt(bytes, 10))
+
+			//send response to the client.
+			resp.Close = true
+			if err := resp.Write(conn); err == nil {
+				log.Printf("%s: %d", req.URL.Path, resp.StatusCode)
+				log.Printf("Content Length: %d", resp.ContentLength)
+			}
+
+		}
+
+		go queueBackend(be)
+
 	}
-}
-
-// Update my stats (interally) it takes pointers, so hopefully we are only
-// reading data from them (the request and the response
-// We could use what is called a Channel in this case, but we are keeping it simple see :
-// https://golang.org/doc/effective_go.html#channels
-func updateStats(req *http.Request, resp *http.Response) int64 {
-	requestLock.Lock()
-	defer requestLock.Unlock()
-
-	bytes := requestBytes[req.URL.Path] + resp.ContentLength
-	requestBytes[req.URL.Path] = bytes
-	return bytes
 }
 
 func getBackend() (*Backend, error) {
@@ -123,10 +119,18 @@ func getBackend() (*Backend, error) {
 	select {
 	// be := <-backendQueue is the syntax for reading from a channel
 	case be := <-backendQueue :
+		log.Println("has backend");
 		return be, nil
 	case <- time.After(100 * time.Millisecond) : 	//A way of waiting for 100ms before acting on anything. Ex:
 							//A backend could become availible and go will select the other case
+		log.Println("Creates backend");
+
+		// Connect to the backend webserver
+		// Consider resolving this somehow (map between port and service)
 		be, err := net.Dial("tcp", "127.0.0.1:8081")
+
+		log.Println("dials 127.0.0.1:8081")
+
 		if err != nil {
 			return nil, err
 		}
